@@ -81,9 +81,9 @@ async function proxy(
         headers: requestHeaders,
         signal: abort.signal,
       });
+      const body = new Uint8Array(await response.arrayBuffer());
       const elapse = Math.round((performance.now() - startTime) * 100) / 100;
 
-      const body = new Uint8Array(await response.arrayBuffer());
       const remoteIp = getRequestRemoteIp(connInfo);
       const responseHeaders = new Headers(response.headers);
 
@@ -144,7 +144,11 @@ async function proxy(
           !(e instanceof Deno.errors.BrokenPipe) &&
           !(e instanceof Deno.errors.ConnectionReset)
         ) {
-          console.error(e);
+          log("error", {
+            url,
+            message: "Error responding to a request",
+            error: e.toString(),
+          });
         }
       });
     }),
