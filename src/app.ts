@@ -1,103 +1,184 @@
-import { Type } from "https://raw.githubusercontent.com/shopstic/typebox/0.16.2/src/typebox.ts";
 import {
   CliProgram,
+  ConnInfo,
   createCliAction,
+  createDeferred,
+  Deferred,
   ExitCode,
-} from "https://raw.githubusercontent.com/shopstic/deno-utils/1.3.0/src/cli-utils.ts";
-import { serve } from "https://deno.land/std@0.92.0/http/server.ts";
-import type { ServerRequest } from "https://deno.land/std@0.92.0/http/server.ts";
+  readableStreamFromIterable,
+  serve,
+  Type,
+} from "./deps.ts";
 
-const queue = new Map<string, ServerRequest[]>();
-
-function getRequestRemoteIp(request: ServerRequest) {
-  const remoteAddr = request.conn.remoteAddr;
-  return remoteAddr.transport === "tcp" ? remoteAddr.hostname : null;
+interface PendingItem {
+  deferredResponse: Deferred<Response>;
+  connInfo: ConnInfo;
 }
 
-async function proxy(request: ServerRequest, targetUrl: string): Promise<void> {
-  const url = `${targetUrl}${request.url}`;
+const queue = new Map<string, Array<PendingItem>>();
+
+function getRequestRemoteIp(connInfo: ConnInfo) {
+  return connInfo.remoteAddr.transport === "tcp"
+    ? connInfo.remoteAddr.hostname
+    : null;
+}
+
+function log(level: "info" | "error", attrs: Record<string, unknown>) {
+  console.log(JSON.stringify({
+    time: new Date().toISOString(),
+    level,
+    ...attrs,
+  }));
+}
+
+async function proxy(
+  request: Request,
+  connInfo: ConnInfo,
+  targetUrl: string,
+  targetRequestTimeoutMs: number,
+): Promise<Response> {
+  const deferred = createDeferred<Response>();
+  const requestUrl = new URL(request.url);
+  const url = `${targetUrl}${requestUrl.pathname}${requestUrl.search}`;
 
   if (queue.has(url)) {
     const pendingList = queue.get(url)!;
-    pendingList.push(request);
+    pendingList.push({
+      deferredResponse: deferred,
+      connInfo,
+    });
 
-    console.log(
-      `[${url}][concurrency=${pendingList.length}] ${
-        pendingList
-          .map((r) => getRequestRemoteIp(r) || "unknown")
-          .join(", ")
-      }`,
-    );
+    log("info", {
+      url,
+      concurrency: pendingList.length,
+      remoteAddrs: pendingList
+        .map(({ connInfo }) => getRequestRemoteIp(connInfo) || "unknown"),
+    });
 
-    return;
+    return await deferred;
   }
 
-  queue.set(url, [request]);
+  queue.set(url, [{ deferredResponse: deferred, connInfo }]);
 
-  console.log(
-    `[${url}][concurrency=1] ${getRequestRemoteIp(request) || "unknown"}`,
-  );
+  log("info", {
+    url,
+    concurrency: 1,
+    remoteAddrs: [getRequestRemoteIp(connInfo) || "unknown"],
+  });
 
-  const requestHeaders = request.headers;
+  const requestHeaders = new Headers(request.headers);
   requestHeaders.delete("host");
   requestHeaders.delete("connection");
 
-  const response = await fetch(url, {
-    method: request.method,
-    headers: requestHeaders,
-  });
+  const abort = new AbortController();
+  const abortId = setTimeout(() => abort.abort(), targetRequestTimeoutMs);
 
-  const remoteIp = getRequestRemoteIp(request);
-  const responseHeaders = response.headers;
+  const responseBuilder = await (async () => {
+    try {
+      const startTime = performance.now();
+      const response = await fetch(url, {
+        method: request.method,
+        headers: requestHeaders,
+        signal: abort.signal,
+      });
+      const elapse = Math.round((performance.now() - startTime) * 100) / 100;
 
-  if (remoteIp !== null) {
-    responseHeaders.set("X-Forwarded-For", remoteIp);
-  }
+      const body = new Uint8Array(await response.arrayBuffer());
+      const remoteIp = getRequestRemoteIp(connInfo);
+      const responseHeaders = new Headers(response.headers);
 
-  if (responseHeaders.get("Transfer-Encoding") === "chunked") {
-    responseHeaders.delete("Transfer-Encoding");
-  }
+      if (remoteIp !== null) {
+        responseHeaders.set("x-forwarded-for", remoteIp);
+      }
 
-  const body = new Uint8Array(await response.arrayBuffer());
+      if (responseHeaders.get("transfer-encoding") === "chunked") {
+        responseHeaders.delete("transfer-encoding");
+      }
+
+      responseHeaders.delete("trailer");
+
+      log("info", {
+        url,
+        status: response.status,
+        elapseMs: elapse,
+      });
+
+      return () =>
+        new Response(readableStreamFromIterable([body]), {
+          status: response.status,
+          headers: responseHeaders,
+        });
+    } catch (e) {
+      log("error", {
+        url,
+        error: e.toString(),
+      });
+
+      if (e instanceof DOMException && e.name === "AbortError") {
+        return () =>
+          new Response(
+            `Timed out requesting ${url} after ${targetRequestTimeoutMs}ms`,
+            {
+              status: 504,
+            },
+          );
+      }
+
+      return () =>
+        new Response(e.toString(), {
+          status: 500,
+        });
+    } finally {
+      clearTimeout(abortId);
+    }
+  })();
 
   const pendingRequests = queue.get(url)!;
   queue.delete(url);
 
   await Promise.all(
-    pendingRequests.map((r) =>
-      r
-        .respond({
-          status: response.status,
-          headers: responseHeaders,
-          trailers: response.trailer ? () => response.trailer : undefined,
-          body,
-        })
-        .catch((e) => {
-          if (
-            !(e instanceof Deno.errors.BrokenPipe) &&
-            !(e instanceof Deno.errors.ConnectionReset)
-          ) {
-            console.error(e);
-          }
-        })
-    ),
+    pendingRequests.map(({ deferredResponse }) => {
+      deferredResponse.resolve(responseBuilder());
+      return deferredResponse.catch((e) => {
+        if (
+          !(e instanceof Deno.errors.BrokenPipe) &&
+          !(e instanceof Deno.errors.ConnectionReset)
+        ) {
+          console.error(e);
+        }
+      });
+    }),
   );
+
+  return await deferred;
 }
 
 const start = createCliAction(
   Type.Object({
     hostname: Type.Optional(Type.String({ minLength: 1 })),
     port: Type.Optional(Type.Number({ minimum: 0, maximum: 65535 })),
+    targetRequestTimeoutMs: Type.Number({ minimum: 1 }),
     proxyTarget: Type.String({ format: "uri" }),
   }),
-  async ({ hostname = "0.0.0.0", port = 8080, proxyTarget }) => {
-    const server = serve({ hostname, port });
+  async (
+    { hostname = "0.0.0.0", port = 8080, proxyTarget, targetRequestTimeoutMs },
+  ) => {
+    log("info", {
+      message: "Proxy server is up",
+      hostname,
+      port,
+      proxyTarget,
+      targetRequestTimeoutMs,
+    });
 
-    console.log(`Proxy server is up at ${hostname}:${port}`);
-
-    for await (const request of server) {
-      proxy(request, proxyTarget);
-    }
+    await serve(
+      (request, connInfo) =>
+        proxy(request, connInfo, proxyTarget, targetRequestTimeoutMs),
+      {
+        hostname,
+        port,
+      },
+    );
 
     return ExitCode.One;
   },

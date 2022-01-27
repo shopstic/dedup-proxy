@@ -1,2 +1,4 @@
-/images/app/app.js
-/.shell-history
+/.zsh_history
+/gen/node_modules
+/result
+/.vscode
